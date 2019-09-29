@@ -257,6 +257,8 @@ const parseAndHandleIntent = function (parsedContent, luResource) {
                         });
                     } else {
                         entitiesFound.forEach(entity => {
+                            // If entity starts with '@' handle it appropriately
+                            handleEntityAndRole(entity);
                             // throw an error if phraselist entity is explicitly labelled in an utterance
                             let nonAllowedPhrseListEntityInUtterance = (parsedContent.LUISJsonStructure.model_features || []).find(item => item.name == entity.entity);
                             if (nonAllowedPhrseListEntityInUtterance !== undefined) {
@@ -394,6 +396,21 @@ const parseAndHandleIntent = function (parsedContent, luResource) {
                 }
             }
         }
+    }
+};
+
+const handleEntityAndRole = function (entity, parsedContent) {
+    if (entity.entity.trim().startsWith('@')) {
+        entity.entity = entity.entity.trim().replace(/^@/g, '');
+    }
+
+    if (entity.role !== undefined) {
+        return;
+    }
+
+    // See if entity is actually a role
+    if (parsedContent.LUISJsonStructure.allRoles && parsedContent.LUISJsonStructure.allRoles.includes(entity.entity)) {
+        
     }
 }
 
