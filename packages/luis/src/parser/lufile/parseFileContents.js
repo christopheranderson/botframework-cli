@@ -25,6 +25,7 @@ const fileToParse = require('./classes/filesToParse');
 const luParser = require('./luParser');
 const DiagnosticSeverity = require('./diagnostic').DiagnosticSeverity;
 const BuildDiagnostic = require('./diagnostic').BuildDiagnostic;
+const EntityTypeEnum = require('./enums/lusiEntityTypes');
 const parseFileContentsModule = {
     /**
      * Main parser code to parse current file contents into LUIS and QNA sections.
@@ -112,10 +113,13 @@ const parseLuAndQnaWithAntlr = async function (parsedContent, fileContent, log, 
 
     if (luResource.Errors && luResource.Errors.length > 0) {
         if (log) {
-            process.stdout.write(luResource.Errors.filter(error => error.Severity === DiagnosticSeverity.WARN).map(warn => warn.toString()).join('\n').concat('\n'));
+            var warns = luResource.Errors.filter(error => (error && error.Severity && error.Severity === DiagnosticSeverity.WARN));
+            if (warns.length > 0) {
+                process.stdout.write(warns.map(warn => warn.toString()).join('\n').concat('\n'));
+            }
         }
 
-        var errors = luResource.Errors.filter(error => error.Severity === DiagnosticSeverity.ERROR);
+        var errors = luResource.Errors.filter(error => (error && error.Severity && error.Severity === DiagnosticSeverity.ERROR));
         if (errors.length > 0) {
             throw (new exception(retCode.errorCode.INVALID_LINE, errors.map(error => error.toString()).join('\n')));
         }
@@ -129,6 +133,9 @@ const parseLuAndQnaWithAntlr = async function (parsedContent, fileContent, log, 
 
     // parse entity section
     parseAndHandleEntity(parsedContent, luResource, log, locale);
+
+    // parse entity definition v2 section
+    parseAndHandleEntityV2(parsedContent, luResource, log, locale);
 
     // parse qna section
     parseAndHandleQna(parsedContent, luResource);
@@ -416,6 +423,442 @@ const handleEntityAndRole = function (entity, parsedContent) {
 }
 
 /**
+ * Helper function to get entity type based on a name match
+ * @param {String} entityName name of entity to look up type for.
+ * @param {Object[]} entities collection of entities in the current application
+ */
+const getEntityType = function(entityName, entities) {
+    let entityFound = (entities || []).find(item => item.Name == entityName);
+    return entityFound ? entityFound.Type : undefined;
+};
+
+/**
+ * Helper function to validate that new roles being added are unique at the application level.
+ * @param {Object} parsedContent with that contains list of additional files to parse, parsed LUIS object and parsed QnA object
+ * @param {String[]} roles string array of new roles to be added
+ * @param {String} line current line being parsed.
+ * @param {String} entityName name of the entity being added.
+ */
+const validateAndGetRoles = function(parsedContent, roles, line, entityName) {
+    let newRoles = roles ? roles.split(',').map(item => item.trim()) : [];
+
+    // entity roles need to unique within the application
+    if(parsedContent.LUISJsonStructure.allRoles) {
+        newRoles.forEach(role => {
+            if (parsedContent.LUISJsonStructure.allRoles.includes(role)) {
+                let errorMsg = `Roles must be unique across entity types. Invalid role definition found "${entityName}"`;
+                let error = BuildDiagnostic({
+                    message: errorMsg,
+                    context: line
+                })
+                throw (new exception(retCode.errorCode.INVALID_INPUT, error.toString()));
+            }
+        })
+    } else {
+        parsedContent.LUISJsonStructure.allRoles = newRoles;
+    }
+    return newRoles;
+};
+
+/**
+ * 
+ * @param {parserObj} Object with that contains list of additional files to parse, parsed LUIS object and parsed QnA object
+ * @param {LUResouce} luResource resources extracted from lu file content
+ * @param {boolean} log indicates where verbose flag is set 
+ * @param {String} locale current target locale
+ * @throws {exception} Throws on errors. exception object includes errCode and text.
+ */
+const parseAndHandleEntityV2 = function (parsedContent, luResource, log, locale) {
+    // handle new entity definitions.
+    let entities = luResource.NewEntities;
+    if (entities && entities.length > 0) {
+        for (const entity of entities) {
+            let entityName = entity.Name.replace(/^[\'\"]|[\'\"]$/g, "");
+            let entityType = !entity.Type ? getEntityType(entity.Name, entities) : entity.Type;
+            if (!entityType) {
+                let errorMsg = `No type definition found for entity "${entityName}"`;
+                let error = BuildDiagnostic({
+                    message: errorMsg,
+                    context: entity.ParseTree.newEntityLine()
+                })
+                throw (new exception(retCode.errorCode.INVALID_INPUT, error.toString()));
+            };
+
+            if (entityType === entityName) {
+                let errorMsg = `Entity name "${entityName}" cannot be the same as entity type "${entityType}"`;
+                let error = BuildDiagnostic({
+                    message: errorMsg,
+                    context: entity.ParseTree.newEntityLine()
+                })
+                throw (new exception(retCode.errorCode.INVALID_INPUT, error.toString()));
+            }
+            let entityRoles = validateAndGetRoles(parsedContent, entity.Roles, entity.ParseTree.newEntityLine(), entityName);
+            let PAEntityRoles = RemoveDuplicatePatternAnyEntity(parsedContent, entityName, entityType, entity.ParseTree.newEntityLine());
+            if (PAEntityRoles.length > 0) {
+                PAEntityRoles.forEach(role => {
+                    if (!entityRoles.includes(role)) entityRoles.push(role);
+                })
+            }
+            switch(entityType) {
+                case EntityTypeEnum.SIMPLE: 
+                    addItemOrRoleIfNotPresent(parsedContent.LUISJsonStructure, LUISObjNameEnum.ENTITIES, entityName, entityRoles);
+                    break;
+                case EntityTypeEnum.COMPOSITE:
+                    let candidateChildren = [];
+                    if (entity.CompositeDefinition) {
+                        entity.CompositeDefinition.replace(/[\[\]]/g, '').split(/[,;]/g).map(item => item.trim()).forEach(item => candidateChildren.push(item));
+                    }
+                    if (entity.ListBody) {
+                        entity.ListBody.forEach(line => {
+                            line.replace(/[\[\]]/g, '').split(/[,;]/g).map(item => item.trim()).forEach(item => candidateChildren.push(item));
+                        })
+                    }
+                    handleComposite(parsedContent, entityName,`[${candidateChildren.join(',')}]`, entityRoles, entity.ParseTree.newEntityLine());
+                    break;
+                case EntityTypeEnum.LIST:
+                    handleClosedList(parsedContent, entityName, entity.ListBody, entityRoles, entity.ParseTree.newEntityLine());
+                    break;
+                case EntityTypeEnum.PATTERNANY:
+                    handlePatternAny(parsedContent, entityName, entityRoles, entity.ParseTree.newEntityLine());
+                    break;
+                case EntityTypeEnum.PREBUILT:
+                    handlePrebuiltEntity(parsedContent, 'prebuilt', entityName, entityRoles, locale, log, entity.ParseTree.newEntityLine());
+                    break;
+                case EntityTypeEnum.REGEX:
+                    if (entity.ListBody[0]) {
+                        handleRegExEntity(parsedContent, entityName, entity.ListBody[0], entityRoles, entity.ParseTree.newEntityLine());
+                    } else {
+                        handleRegExEntity(parsedContent, entityName, entity.RegexDefinition, entityRoles, entity.ParseTree.newEntityLine());
+                    } 
+                    break;
+                case EntityTypeEnum.ML:
+                    break;
+                case EntityTypeEnum.PHRASELIST:
+                    handlePhraseList(parsedContent, entityName, undefined, entityRoles, entity.ListBody, entity.ParseTree.newEntityLine());
+                default:
+                    //Unknown entity type
+                    break;
+            }
+        }
+    }
+};
+
+/**
+ * Helper function to handle pattern.any entity
+ * @param {Object} parsedContent parsed LUIS, QnA and QnA alteration object
+ * @param {String} entityName entity name
+ * @param {String} entityRoles collection of entity roles
+ */
+const handlePatternAny = function(parsedContent, entityName, entityRoles) {
+     // check if this patternAny entity is already labelled in an utterance and or added as a simple entity. if so, throw an error.
+     try {
+        let rolesImport = VerifyAndUpdateSimpleEntityCollection(parsedContent, entityName, 'Pattern.Any');
+        if (rolesImport.length !== 0) {
+            rolesImport.forEach(role => !entityRoles.includes(role) ? entityRoles.push(role) : undefined);
+        }
+    } catch (err) {
+        throw (err);
+    }
+
+    let PAExists = parsedContent.LUISJsonStructure.patternAnyEntities.find(item => item.name == entityName);
+    if (PAExists === undefined) {
+        parsedContent.LUISJsonStructure.patternAnyEntities.push(new helperClass.patternAnyEntity(entityName, [], entityRoles));
+    } else {
+        entityRoles.forEach(item => {
+            if (!PAExists.roles.includes) PAExists.roles.push(item);
+        })
+    }
+}
+/**
+ * Helper function to remove duplicate pattern any definitions.
+ * @param {Object} parsedContent Object containing current parsed content - LUIS, QnA, QnA alterations.
+ * @param {String} pEntityName name of entity
+ * @param {String} entityType type of entity
+ * @param {String} entityLine current line being parsed
+ */
+const RemoveDuplicatePatternAnyEntity = function(parsedContent, pEntityName, entityType, entityLine) {
+    // see if we already have this as Pattern.Any entity
+    // see if we already have this in patternAny entity collection; if so, remove it but remember the roles (if any)
+    let PAIdx = -1;
+    let entityRoles = [];
+    let PAEntityFound = parsedContent.LUISJsonStructure.patternAnyEntities.find(function(item, idx) {
+        if(item.name === pEntityName) {
+            PAIdx = idx;
+            return true
+        } else {
+            return false;
+        }
+    });
+    if (PAEntityFound !== undefined && PAIdx !== -1) {
+        if (entityType.toLowerCase().trim().includes('phraselist')) {
+            let errorMsg = `Phrase lists cannot be used as an entity in a pattern "${pEntityName}"`;
+            let error = BuildDiagnostic({
+                message: errorMsg,
+                context: entityLine
+            })
+            throw (new exception(retCode.errorCode.INVALID_INPUT, error.toString()));
+        } 
+        entityRoles = (PAEntityFound.roles.length !== 0) ? PAEntityFound.roles : [];
+        parsedContent.LUISJsonStructure.patternAnyEntities.splice(PAIdx, 1);
+    }
+    return entityRoles;
+};
+
+/**
+ * 
+ * @param {Object} parsedContent parsed content that includes LUIS, QnA, QnA alternations
+ * @param {String} entityName entity name
+ * @param {String} entityType entity type
+ * @param {String []} entityRoles Array of roles
+ * @param {String []} valuesList Array of individual lines to be processed and added to phrase list.
+ */
+const handlePhraseList = function(parsedContent, entityName, entityType, entityRoles, valuesList, currentLine) {
+    if (entityRoles.length !== 0) {
+        let errorMsg = `Phrase list entity ${entityName} has invalid role definition with roles = ${entityRoles.join(', ')}. Roles are not supported for Phrase Lists`;
+        let error = BuildDiagnostic({
+            message: errorMsg,
+            context: currentLine
+        })
+
+        throw (new exception(retCode.errorCode.INVALID_INPUT, error.toString()));
+    }
+    // check if this phraselist entity is already labelled in an utterance and or added as a simple entity. if so, throw an error.
+    try {
+        let rolesImport = VerifyAndUpdateSimpleEntityCollection(parsedContent, entityName, 'Phrase List');
+        if (rolesImport.length !== 0) {
+            rolesImport.forEach(role => !entityRoles.includes(role) ? entityRoles.push(role) : undefined);
+        }
+    } catch (err) {
+        throw (err);
+    }
+    // is this interchangeable? 
+    let intc = false;
+    let lEntityType = entityType ? entityType : entityName;
+    if (lEntityType.toLowerCase().includes('interchangeable')) {
+        intc = true;
+        if (entityType === undefined) entityName = lEntityType.split(/\(.*\)/g)[0];
+    } 
+    // add this to phraseList if it doesnt exist
+    let pLValues = [];
+    for (const phraseListValues of valuesList) {
+        phraseListValues.split(/[,;]/g).map(item => item.trim()).forEach(item => pLValues.push(item));
+   }
+
+    let pLEntityExists = parsedContent.LUISJsonStructure.model_features.find(item => item.name == entityName);
+    if (pLEntityExists) {
+        if (pLEntityExists.mode === intc) {
+            // for each item in plValues, see if it already exists
+            pLValues.forEach(function (plValueItem) {
+                if (!pLEntityExists.words.includes(plValueItem)) pLEntityExists.words += (pLEntityExists.words !== '' ? ',' : '') + plValueItem;
+            })
+        } else {
+            let errorMsg = `Phrase list: "${entityName}" has conflicting definitions. One marked interchangeable and another not interchangeable`;
+            let error = BuildDiagnostic({
+                message: errorMsg,
+                context: entity.ParseTree.entityLine()
+            })
+
+            throw (new exception(retCode.errorCode.INVALID_INPUT, error.toString()));
+        }
+    } else {
+        parsedContent.LUISJsonStructure.model_features.push(new helperClass.modelObj(entityName, intc, pLValues.join(','), true));
+    }
+}
+
+/**
+ * 
+ * @param {Object} parsedContent parsed LUIS, QnA and QnA alternations
+ * @param {String} entityName entity name
+ * @param {String} entityType entity type
+ * @param {String []} entityRoles list of entity roles
+ * @param {String} locale current locale
+ * @param {Boolean} log boolean to indicate if errors should be sent to stdout
+ * @param {String} currentLine current line being parsed.
+ */
+const handlePrebuiltEntity = function(parsedContent, entityName, entityType, entityRoles, locale, log, currentLine) {
+    locale = locale ? locale.toLowerCase() : 'en-us';
+    // check if this pre-built entity is already labelled in an utterance and or added as a simple entity. if so, throw an error.
+    try {
+        let rolesImport = VerifyAndUpdateSimpleEntityCollection(parsedContent, entityType, entityName);
+        if (rolesImport.length !== 0) {
+            rolesImport.forEach(role => !entityRoles.includes(role) ? entityRoles.push(role) : undefined);
+        }
+    } catch (err) {
+        throw (err);
+    }
+    // verify if the requested entityType is available in the requested locale
+    if (!builtInTypes.consolidatedList.includes(entityType)) {
+        let errorMsg = `Unknown PREBUILT entity '${entityType}'. Available pre-built types are ${builtInTypes.consolidatedList.join(',')}`;
+        let error = BuildDiagnostic({
+            message: errorMsg,
+            context: currentLine
+        })
+
+        throw (new exception(retCode.errorCode.INVALID_INPUT, error.toString()));
+    }
+    let prebuiltCheck = builtInTypes.perLocaleAvailability[locale][entityType];
+    if (prebuiltCheck === null) {
+        if (log) {
+            process.stdout.write(chalk.default.yellowBright('[WARN]: Requested PREBUILT entity "' + entityType + ' is not available for the requested locale: ' + locale + '\n'));
+            process.stdout.write(chalk.default.yellowBright('  Skipping this prebuilt entity..\n'));
+        } else {
+            let errorMsg = `PREBUILT entity '${entityType}' is not available for the requested locale '${locale}'`;
+            let error = BuildDiagnostic({
+                message: errorMsg,
+                context: currentLine
+            })
+
+            throw (new exception(retCode.errorCode.INVALID_INPUT, error.toString()));
+        }
+    } else if (prebuiltCheck && prebuiltCheck.includes('datetime')) {
+        if (log) {
+            process.stdout.write(chalk.default.yellowBright('[WARN]: PREBUILT entity "' + entityType + ' is not available for the requested locale: ' + locale + '\n'));
+            process.stdout.write(chalk.default.yellowBright('  Switching to ' + builtInTypes.perLocaleAvailability[locale][entityType] + ' instead.\n'));
+        }
+        entityType = builtInTypes.perLocaleAvailability[locale][entityType];
+        addItemOrRoleIfNotPresent(parsedContent.LUISJsonStructure, LUISObjNameEnum.PREBUILT, entityType, entityRoles);
+    } else {
+        // add to prebuiltEntities if it does not exist there.
+        addItemOrRoleIfNotPresent(parsedContent.LUISJsonStructure, LUISObjNameEnum.PREBUILT, entityType, entityRoles);
+    }
+};
+/**
+ * Helper function to handle composite entity definition.
+ * @param {Object} parsedContent Object representing parsed content
+ * @param {String} entityName entity name
+ * @param {String} entityType entity type
+ * @param {String []} entityRoles collection of roles
+ * @param {String} currentLine current line being parsed 
+ * @param {Boolean} inlineChildRequired boolean to indicate if children definition must be defined inline.
+ */
+const handleComposite = function(parsedContent, entityName, entityType, entityRoles, currentLine, inlineChildRequired) {
+    // remove simple entity definitions for composites but carry forward roles.
+    // Find this entity if it exists in the simple entity collection
+    let simpleEntityExists = (parsedContent.LUISJsonStructure.entities || []).find(item => item.name == entityName);
+    if (simpleEntityExists !== undefined) {
+        // take and add any roles into the roles list
+        (simpleEntityExists.roles || []).forEach(role => !entityRoles.includes(role) ? entityRoles.push(role) : undefined);
+        // remove this simple entity definition
+        for (var idx = 0; idx < parsedContent.LUISJsonStructure.entities.length; idx++) {
+            if (parsedContent.LUISJsonStructure.entities[idx].name === simpleEntityExists.name) {
+                parsedContent.LUISJsonStructure.entities.splice(idx, 1);
+            }
+        }
+    }
+    // handle composite entity definition
+    // drop [] and trim
+    let childDefinition = entityType.trim().replace('[', '').replace(']', '').trim();
+    if (childDefinition.length === 0 && inlineChildRequired) {
+        let errorMsg = `Composite entity: ${entityName} is missing child entity definitions. Child entities are denoted via [entity1, entity2] notation.`;
+        let error = BuildDiagnostic({
+            message: errorMsg,
+            context: currentLine
+        })
+
+        throw (new exception(retCode.errorCode.INVALID_COMPOSITE_ENTITY, error.toString()));
+    }
+    // split the children based on ',' or ';' delimiter. Trim each child to remove white spaces.
+    let compositeChildren = childDefinition !== "" ? childDefinition.split(new RegExp(/[,;]/g)).map(item => item.trim()) : [];
+    // add this composite entity if it does not exist
+    let compositeEntity = (parsedContent.LUISJsonStructure.composites || []).find(item => item.name == entityName);
+    if (compositeEntity === undefined) {
+        // add new composite entity
+        parsedContent.LUISJsonStructure.composites.push(new helperClass.compositeEntity(entityName, compositeChildren, entityRoles));
+
+        // remove composite that might have been tagged as a simple entity due to inline entity definition in an utterance
+        parsedContent.LUISJsonStructure.entities = (parsedContent.LUISJsonStructure.entities || []).filter(entity => entity.name != entityName);
+    } else {
+        if (compositeEntity.children.length !== 0 && JSON.stringify(compositeChildren.sort()) !== JSON.stringify(compositeEntity.children.sort())) {
+            let errorMsg = `Composite entity: ${entityName} has multiple definition with different children. \n 1. ${compositeChildren.join(', ')}\n 2. ${compositeEntity.children.join(', ')}`;
+            let error = BuildDiagnostic({
+                message: errorMsg,
+                context: currentLine
+            })
+
+            throw (new exception(retCode.errorCode.INVALID_COMPOSITE_ENTITY, error.toString()));
+        } else {
+            // update roles
+            // update children
+            compositeChildren.forEach(item => compositeEntity.children.push(item));
+            addItemOrRoleIfNotPresent(parsedContent.LUISJsonStructure, LUISObjNameEnum.COMPOSITES, compositeEntity.name, entityRoles);
+        }
+    }
+};
+
+/**
+ * Helper function to handle list entity definition
+ * @param {Object} parsedContent parsed LUIS, QnA and QnA alternations content
+ * @param {String} entityName entity name
+ * @param {String []} listLines lines to parse for the list entity
+ * @param {String []} entityRoles collection of roles found
+ * @param {String} currentLine current line being parsed.
+ */
+const handleClosedList = function (parsedContent, entityName, listLines, entityRoles, currentLine) {
+    // check if this list entity is already labelled in an utterance and or added as a simple entity. if so, throw an error.
+    try {
+        let rolesImport = VerifyAndUpdateSimpleEntityCollection(parsedContent, entityName, 'List');
+        rolesImport.forEach(role => {
+            if (!entityRoles.includes(role)) {
+                entityRoles.push(role)
+            }
+        });
+    } catch (err) {
+        throw (err);
+    }
+    // Find closed list by this name if it exists
+    let closedListExists = parsedContent.LUISJsonStructure.closedLists.find(item => item.name == entityName);
+    let addCL = false;
+    if (closedListExists === undefined) {
+        closedListExists = new helperClass.closedLists(entityName);
+        addCL = true;
+    }
+    let addNV = false;    
+    let nvExists;
+    listLines.forEach(line => {
+        if (line.toLowerCase().endsWith(':')) {
+            // close if we are in the middle of a sublist.
+            if (addNV) {
+                closedListExists.subLists.push(nvExists);
+                addNV = false;
+                nvExists = undefined;
+            }
+            // find the matching sublist and if none exists, create one. 
+            let normalizedValue = line.replace(/:$/g, '').trim();
+            nvExists = closedListExists.subLists.find(item => item.canonicalForm == normalizedValue);
+            if (nvExists === undefined) {
+                nvExists = new helperClass.subList(normalizedValue);
+                addNV = true;
+            }
+        } else {
+            line.split(/[,;]/g).map(item => item.trim()).forEach(item => {
+                if (!nvExists || !nvExists.list) {
+                    let errorMsg = `Closed list ${entityName} has synonyms list "${line}" without a normalized value.`;
+                    let error = BuildDiagnostic({
+                        message: errorMsg,
+                        context: currentLine
+                    })
+
+                    throw (new exception(retCode.errorCode.SYNONYMS_NOT_A_LIST, error.toString()));
+                }
+                if (!nvExists.list.includes(item)) nvExists.list.push(item);
+            })
+        }
+    });
+
+    if (addNV) {
+        closedListExists.subLists.push(nvExists);
+    }
+
+    // merge roles
+    entityRoles.forEach(item => {
+        if(!closedListExists.roles.includes(item)) closedListExists.roles.push(item);
+    });
+
+    if (addCL) {
+        parsedContent.LUISJsonStructure.closedLists.push(closedListExists);
+    }
+}
+/**
  * Reference parser code to parse reference section.
  * @param {parserObj} Object with that contains list of additional files to parse, parsed LUIS object and parsed QnA object
  * @param {LUResouce} luResource resources extracted from lu file content
@@ -434,56 +877,20 @@ const parseAndHandleEntity = function (parsedContent, luResource, log, locale) {
             let entityRoles = parsedRoleAndType.roles;
             entityType = parsedRoleAndType.entityType;
             let pEntityName = (entityName.toLowerCase() === 'prebuilt') ? entityType : entityName;
+            
             // see if we already have this as Pattern.Any entity
             // see if we already have this in patternAny entity collection; if so, remove it but remember the roles (if any)
-            for (let i in parsedContent.LUISJsonStructure.patternAnyEntities) {
-                if (parsedContent.LUISJsonStructure.patternAnyEntities[i].name === pEntityName) {
-                    if (entityType.toLowerCase().trim().includes('phraselist')) {
-                        let errorMsg = `Phrase lists cannot be used as an entity in a pattern "${pEntityName}"`;
-                        let error = BuildDiagnostic({
-                            message: errorMsg,
-                            context: entity.ParseTree.entityLine()
-                        })
-
-                        throw (new exception(retCode.errorCode.INVALID_INPUT, error.toString()));
-                    }
-                    if (parsedContent.LUISJsonStructure.patternAnyEntities[i].roles.length !== 0) entityRoles = parsedContent.LUISJsonStructure.patternAnyEntities[i].roles;
-                    parsedContent.LUISJsonStructure.patternAnyEntities.splice(i, 1);
-                    break;
-                }
+            let PAEntityRoles = RemoveDuplicatePatternAnyEntity(parsedContent, pEntityName, entityType, entity.ParseTree.entityLine());
+            if (PAEntityRoles.length > 0) {
+                PAEntityRoles.forEach(role => {
+                    if (!entityRoles.includes(role)) entityRoles.push(role);
+                })
             }
 
             // add this entity to appropriate place
             // is this a builtin type?
             if (builtInTypes.consolidatedList.includes(entityType)) {
-                locale = locale ? locale.toLowerCase() : 'en-us';
-                // check if this pre-built entity is already labelled in an utterance and or added as a simple entity. if so, throw an error.
-                try {
-                    let rolesImport = VerifyAndUpdateSimpleEntityCollection(parsedContent, entityType, entityName);
-                    if (rolesImport.length !== 0) {
-                        rolesImport.forEach(role => !entityRoles.includes(role) ? entityRoles.push(role) : undefined);
-                    }
-                } catch (err) {
-                    throw (err);
-                }
-                // verify if the requested entityType is available in the requested locale
-                let prebuiltCheck = builtInTypes.perLocaleAvailability[locale][entityType];
-                if (prebuiltCheck === null) {
-                    if (log) {
-                        process.stdout.write(chalk.default.yellowBright('[WARN]: Requested PREBUILT entity "' + entityType + ' is not available for the requested locale: ' + locale + '\n'));
-                        process.stdout.write(chalk.default.yellowBright('  Skipping this prebuilt entity..\n'));
-                    }
-                } else if (prebuiltCheck && prebuiltCheck.includes('datetime')) {
-                    if (log) {
-                        process.stdout.write(chalk.default.yellowBright('[WARN]: PREBUILT entity "' + entityType + ' is not available for the requested locale: ' + locale + '\n'));
-                        process.stdout.write(chalk.default.yellowBright('  Switching to ' + builtInTypes.perLocaleAvailability[locale][entityType] + ' instead.\n'));
-                    }
-                    entityType = builtInTypes.perLocaleAvailability[locale][entityType];
-                    addItemOrRoleIfNotPresent(parsedContent.LUISJsonStructure, LUISObjNameEnum.PREBUILT, entityType, entityRoles);
-                } else {
-                    // add to prebuiltEntities if it does not exist there.
-                    addItemOrRoleIfNotPresent(parsedContent.LUISJsonStructure, LUISObjNameEnum.PREBUILT, entityType, entityRoles);
-                }
+                handlePrebuiltEntity(parsedContent, entityName, entityType, entityRoles, locale, log, entity.ParseTree.entityLine());
             } else if (entityType.toLowerCase() === 'simple') {
                 // add this to entities if it doesnt exist
                 addItemOrRoleIfNotPresent(parsedContent.LUISJsonStructure, LUISObjNameEnum.ENTITIES, entityName, entityRoles);
@@ -543,160 +950,12 @@ const parseAndHandleEntity = function (parsedContent, luResource, log, locale) {
                     }
                 }
             } else if (entityType.toLowerCase().trim().indexOf('phraselist') === 0) {
-                if (entityRoles.length !== 0) {
-                    let errorMsg = `Phrase list entity ${entityName} has invalid role definition with roles = ${entityRoles.join(', ')}. Roles are not supported for Phrase Lists`;
-                    let error = BuildDiagnostic({
-                        message: errorMsg,
-                        context: entity.ParseTree.entityLine()
-                    })
-
-                    throw (new exception(retCode.errorCode.INVALID_INPUT, error.toString()));
-                }
-                // check if this phraselist entity is already labelled in an utterance and or added as a simple entity. if so, throw an error.
-                try {
-                    let rolesImport = VerifyAndUpdateSimpleEntityCollection(parsedContent, entityName, 'Phrase List');
-                    if (rolesImport.length !== 0) {
-                        rolesImport.forEach(role => !entityRoles.includes(role) ? entityRoles.push(role) : undefined);
-                    }
-                } catch (err) {
-                    throw (err);
-                }
-                // is this interchangeable? 
-                let intc = false;
-                if (entityType.toLowerCase().includes('interchangeable')) intc = true;
-                // add this to phraseList if it doesnt exist
-                let pLValues = new Array();
-                let plValuesList = "";
-
-                for (const phraseListValues of entity.SynonymsOrPhraseList) {
-                    pLValues.push(phraseListValues.split(','));
-                    plValuesList = plValuesList + phraseListValues + ',';
-                }
-
-                // remove the last ','
-                plValuesList = plValuesList.substring(0, plValuesList.lastIndexOf(','));
-                let modelExists = false;
-                if (parsedContent.LUISJsonStructure.model_features.length > 0) {
-                    let modelIdx = 0;
-                    for (modelIdx in parsedContent.LUISJsonStructure.model_features) {
-                        if (parsedContent.LUISJsonStructure.model_features[modelIdx].name === entityName) {
-                            modelExists = true;
-                            break;
-                        }
-                    }
-                    if (modelExists) {
-                        if (parsedContent.LUISJsonStructure.model_features[modelIdx].mode === intc) {
-                            // for each item in plValues, see if it already exists
-                            pLValues.forEach(function (plValueItem) {
-                                if (!parsedContent.LUISJsonStructure.model_features[modelIdx].words[0].includes(plValueItem)) parsedContent.LUISJsonStructure.model_features[modelIdx].words += ',' + pLValues;
-                            })
-                        } else {
-                            let errorMsg = `Phrase list: "${entityName}" has conflicting definitions. One marked interchangeable and another not interchangeable`;
-                            let error = BuildDiagnostic({
-                                message: errorMsg,
-                                context: entity.ParseTree.entityLine()
-                            })
-
-                            throw (new exception(retCode.errorCode.INVALID_INPUT, error.toString()));
-                        }
-
-                    } else {
-                        parsedContent.LUISJsonStructure.model_features.push(new helperClass.modelObj(entityName, intc, plValuesList, true));
-                    }
-                } else {
-                    parsedContent.LUISJsonStructure.model_features.push(new helperClass.modelObj(entityName, intc, plValuesList, true));
-                }
+                handlePhraseList(parsedContent, entityName, entityType, entityRoles, entity.SynonymsOrPhraseList, entity.ParseTree.entityLine());
             } else if (entityType.startsWith('[')) {
-                // remove simple entity definitions for composites but carry forward roles.
-                // Find this entity if it exists in the simple entity collection
-                let simpleEntityExists = (parsedContent.LUISJsonStructure.entities || []).find(item => item.name == entityName);
-                if (simpleEntityExists !== undefined) {
-                    // take and add any roles into the roles list
-                    (simpleEntityExists.roles || []).forEach(role => !entityRoles.includes(role) ? entityRoles.push(role) : undefined);
-                    // remove this simple entity definition
-                    for (var idx = 0; idx < parsedContent.LUISJsonStructure.entities.length; idx++) {
-                        if (parsedContent.LUISJsonStructure.entities[idx].name === simpleEntityExists.name) {
-                            parsedContent.LUISJsonStructure.entities.splice(idx, 1);
-                        }
-                    }
-                }
-                // handle composite entity definition
-                // drop [] and trim
-                let childDefinition = entityType.trim().replace('[', '').replace(']', '').trim();
-                if (childDefinition.length === 0) {
-                    let errorMsg = `Composite entity: ${entityName} is missing child entity definitions. Child entities are denoted via [entity1, entity2] notation.`;
-                    let error = BuildDiagnostic({
-                        message: errorMsg,
-                        context: entity.ParseTree.entityLine()
-                    })
-
-                    throw (new exception(retCode.errorCode.INVALID_COMPOSITE_ENTITY, error.toString()));
-                }
-                // split the children based on ',' or ';' delimiter. Trim each child to remove white spaces.
-                let compositeChildren = childDefinition.split(new RegExp(/[,;]/g)).map(item => item.trim());
-                // add this composite entity if it does not exist
-                let compositeEntity = (parsedContent.LUISJsonStructure.composites || []).find(item => item.name == entityName);
-                if (compositeEntity === undefined) {
-                    // add new composite entity
-                    parsedContent.LUISJsonStructure.composites.push(new helperClass.compositeEntity(entityName, compositeChildren, entityRoles));
-
-                    // remove composite that might have been tagged as a simple entity due to inline entity definition in an utterance
-                    parsedContent.LUISJsonStructure.entities = (parsedContent.LUISJsonStructure.entities || []).filter(entity => entity.name != entityName);
-                } else {
-                    if (JSON.stringify(compositeChildren.sort()) !== JSON.stringify(compositeEntity.children.sort())) {
-                        let errorMsg = `Composite entity: ${entityName} has multiple definition with different children. \n 1. ${compositeChildren.join(', ')}\n 2. ${compositeEntity.children.join(', ')}`;
-                        let error = BuildDiagnostic({
-                            message: errorMsg,
-                            context: entity.ParseTree.entityLine()
-                        })
-
-                        throw (new exception(retCode.errorCode.INVALID_COMPOSITE_ENTITY, error.toString()));
-                    } else {
-                        // update roles
-                        addItemOrRoleIfNotPresent(parsedContent.LUISJsonStructure, LUISObjNameEnum.COMPOSITES, compositeEntity.name, entityRoles);
-                    }
-                }
+                handleComposite(parsedContent, entityName, entityType, entityRoles, entity.ParseTree.entityLine(), true);
             } else if (entityType.startsWith('/')) {
                 if (entityType.endsWith('/')) {
-                    // check if this regex entity is already labelled in an utterance and or added as a simple entity. if so, throw an error.
-                    try {
-                        let rolesImport = VerifyAndUpdateSimpleEntityCollection(parsedContent, entityName, 'RegEx');
-                        if (rolesImport.length !== 0) {
-                            rolesImport.forEach(role => !entityRoles.includes(role) ? entityRoles.push(role) : undefined);
-                        }
-                    } catch (err) {
-                        throw (err);
-                    }
-                    // handle regex entity 
-                    let regex = entityType.slice(1).slice(0, entityType.length - 2);
-                    if (regex === '') {
-                        let errorMsg = `RegEx entity: ${regExEntity.name} has empty regex pattern defined.`;
-                        let error = BuildDiagnostic({
-                            message: errorMsg,
-                            context: entity.ParseTree.entityLine()
-                        })
-
-                        throw (new exception(retCode.errorCode.INVALID_REGEX_ENTITY, error.toString()));
-                    }
-                    // add this as a regex entity if it does not exist
-                    let regExEntity = (parsedContent.LUISJsonStructure.regex_entities || []).find(item => item.name == entityName);
-                    if (regExEntity === undefined) {
-                        parsedContent.LUISJsonStructure.regex_entities.push(new helperClass.regExEntity(entityName, regex, entityRoles))
-                    } else {
-                        // throw an error if the pattern is different for the same entity
-                        if (regExEntity.regexPattern !== regex) {
-                            let errorMsg = `RegEx entity: ${regExEntity.name} has multiple regex patterns defined. \n 1. /${regex}/\n 2. /${regExEntity.regexPattern}/`;
-                            let error = BuildDiagnostic({
-                                message: errorMsg,
-                                context: entity.ParseTree.entityLine()
-                            })
-
-                            throw (new exception(retCode.errorCode.INVALID_REGEX_ENTITY, error.toString()));
-                        } else {
-                            // update roles
-                            addItemOrRoleIfNotPresent(parsedContent.LUISJsonStructure, LUISObjNameEnum.REGEX, regExEntity.name, entityRoles);
-                        }
-                    }
+                    handleRegExEntity(parsedContent, entityName, entityType, entityRoles, entity.ParseTree.entityLine());
                 } else {
                     let errorMsg = `RegEx entity: ${regExEntity.name} is missing trailing '/'. Regex patterns need to be enclosed in forward slashes. e.g. /[0-9]/`;
                     let error = BuildDiagnostic({
@@ -709,6 +968,61 @@ const parseAndHandleEntity = function (parsedContent, luResource, log, locale) {
             } else {
                 // TODO: handle other entity types
             }
+        }
+    }
+};
+/**
+ * 
+ * @param {Object} parsedContent Object containing the parsed structure - LUIS, QnA, QnA alterations
+ * @param {String} entityName name of entity
+ * @param {String} entityType type of entity
+ * @param {String []} entityRoles array of entity roles found
+ * @param {String} entityLine current line being parsed/ handled.
+ */
+const handleRegExEntity = function(parsedContent, entityName, entityType, entityRoles, entityLine) {
+    // check if this regex entity is already labelled in an utterance and or added as a simple entity. if so, throw an error.
+    try {
+        let rolesImport = VerifyAndUpdateSimpleEntityCollection(parsedContent, entityName, 'RegEx');
+        if (rolesImport.length !== 0) {
+            rolesImport.forEach(role => !entityRoles.includes(role) ? entityRoles.push(role) : undefined);
+        }
+    } catch (err) {
+        throw (err);
+    }
+    let regex = '';
+    // handle regex entity 
+    if (entityType) {
+        regex = entityType.slice(1, entityType.length - 1);
+        if (regex === '') {
+            let errorMsg = `RegEx entity: ${entityName} has empty regex pattern defined.`;
+            let error = BuildDiagnostic({
+                message: errorMsg,
+                context: entityLine
+            })
+
+            throw (new exception(retCode.errorCode.INVALID_REGEX_ENTITY, error.toString()));
+        }
+    }
+    
+    // add this as a regex entity if it does not exist
+    let regExEntity = (parsedContent.LUISJsonStructure.regex_entities || []).find(item => item.name == entityName);
+    if (regExEntity === undefined) {
+        parsedContent.LUISJsonStructure.regex_entities.push(new helperClass.regExEntity(entityName, regex, entityRoles))
+    } else {
+        // throw an error if the pattern is different for the same entity
+        if (regExEntity.regexPattern !== '' && regex !== '' && regExEntity.regexPattern !== regex) {
+            let errorMsg = `RegEx entity: ${regExEntity.name} has multiple regex patterns defined. \n 1. /${regex}/\n 2. /${regExEntity.regexPattern}/`;
+            let error = BuildDiagnostic({
+                message: errorMsg,
+                context: entityLine
+            })
+
+            throw (new exception(retCode.errorCode.INVALID_REGEX_ENTITY, error.toString()));
+        } else {
+            // update roles
+            addItemOrRoleIfNotPresent(parsedContent.LUISJsonStructure, LUISObjNameEnum.REGEX, regExEntity.name, entityRoles);
+            // add regex pattern
+            if (regExEntity.regexPattern === '') regExEntity.regexPattern = regex;
         }
     }
 }
