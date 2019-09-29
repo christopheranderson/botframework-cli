@@ -265,7 +265,7 @@ const parseAndHandleIntent = function (parsedContent, luResource) {
                     } else {
                         entitiesFound.forEach(entity => {
                             // If entity starts with '@' handle it appropriately
-                            handleEntityAndRole(entity);
+                            handleEntityAndRole(entity, parsedContent);
                             // throw an error if phraselist entity is explicitly labelled in an utterance
                             let nonAllowedPhrseListEntityInUtterance = (parsedContent.LUISJsonStructure.model_features || []).find(item => item.name == entity.entity);
                             if (nonAllowedPhrseListEntityInUtterance !== undefined) {
@@ -408,17 +408,16 @@ const parseAndHandleIntent = function (parsedContent, luResource) {
 
 const handleEntityAndRole = function (entity, parsedContent) {
     if (entity.entity.trim().startsWith('@')) {
-        entity.entity = entity.entity.trim().replace(/^@/g, '');
-    }
-
-    if (entity.role !== undefined) {
+        if (entity.role !== undefined) {
+            return;
+        }
+        // See if entity is actually a role
+        let entityWithRole = (parsedContent.LUISJsonStructure.allRoles || []).find(item => item.roles.includes(entity.entity.trim().replace(/^@/g, '')));
+        if (entityWithRole !== undefined) {
+            entity.entity = entityWithRole.entity;
+        }
+    } else {
         return;
-    }
-
-    // See if entity is actually a role
-    let entityWithRole = (parsedContent.LUISJsonStructure.allRoles || []).find(item => item.roles.includes(entity.role));
-    if (entityWithRole !== undefined) {
-        entity.entity = entityWithRole.entity;
     }
 }
 
@@ -439,23 +438,42 @@ const getEntityType = function(entityName, entities) {
  * @param {String} line current line being parsed.
  * @param {String} entityName name of the entity being added.
  */
-const validateAndGetRoles = function(parsedContent, roles, line, entityName) {
+const validateAndGetRoles = function(parsedContent, roles, line, entityName, entityType) {
     let newRoles = roles ? roles.split(',').map(item => item.trim()) : [];
 
     // entity roles need to unique within the application
     if(parsedContent.LUISJsonStructure.allRoles) {
         newRoles.forEach(role => {
-            if (parsedContent.LUISJsonStructure.allRoles.includes(role)) {
-                let errorMsg = `Roles must be unique across entity types. Invalid role definition found "${entityName}"`;
+            let foundType = '';
+            let roleExists = parsedContent.LUISJsonStructure.allRoles.find(item => {
+                if (item.roles.includes(role)) {
+                    foundType = "Duplicate role found";
+                    return true;
+                } else if (item.entity === entityName) {
+                    foundType = "Duplicate entity found";
+                    return true;
+                } else if (item.roles.includes(entityName)) {
+                    foundType = "Entity name conflicts with another role definition"
+                    return true;
+                } else if (item.entity === role) {
+                    foundType = "Role name conflicts with another entity name";
+                    return true;
+                }
+                return false;
+            });
+            if (roleExists !== undefined) {
+                let errorMsg = `Entity names and roles must be unique across entity types. ${foundType}. '@ ${entityType} ${entityName} ${role}' conflicts with '@ ${roleExists.type} ${roleExists.entity}${roleExists.roles.length > 0 ? ` hasRoles ${roleExists.roles.join(',')}` : ''}'`;
                 let error = BuildDiagnostic({
                     message: errorMsg,
                     context: line
                 })
                 throw (new exception(retCode.errorCode.INVALID_INPUT, error.toString()));
+            } else {
+                parsedContent.LUISJsonStructure.allRoles.push(new helperClass.entityRoles(entityName, entityType, newRoles))
             }
         })
     } else {
-        parsedContent.LUISJsonStructure.allRoles = newRoles;
+        parsedContent.LUISJsonStructure.allRoles = [new helperClass.entityRoles(entityName, entityType, newRoles)];
     }
     return newRoles;
 };
@@ -492,7 +510,7 @@ const parseAndHandleEntityV2 = function (parsedContent, luResource, log, locale)
                 })
                 throw (new exception(retCode.errorCode.INVALID_INPUT, error.toString()));
             }
-            let entityRoles = validateAndGetRoles(parsedContent, entity.Roles, entity.ParseTree.newEntityLine(), entityName);
+            let entityRoles = validateAndGetRoles(parsedContent, entity.Roles, entity.ParseTree.newEntityLine(), entityName, entityType);
             let PAEntityRoles = RemoveDuplicatePatternAnyEntity(parsedContent, entityName, entityType, entity.ParseTree.newEntityLine());
             if (PAEntityRoles.length > 0) {
                 PAEntityRoles.forEach(role => {
@@ -1278,7 +1296,6 @@ const addItemIfNotPresent = function (collection, type, value) {
         collection[type].push(itemObj);
     }
 };
-
 /**
  * Helper function to add an item to collection if it does not exist
  * @param {object} collection contents of the current collection
