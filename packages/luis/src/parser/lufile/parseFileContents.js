@@ -409,8 +409,9 @@ const handleEntityAndRole = function (entity, parsedContent) {
     }
 
     // See if entity is actually a role
-    if (parsedContent.LUISJsonStructure.allRoles && parsedContent.LUISJsonStructure.allRoles.includes(entity.entity)) {
-        
+    let entityWithRole = (parsedContent.LUISJsonStructure.allRoles || []).find(item => item.roles.includes(entity.role));
+    if (entityWithRole !== undefined) {
+        entity.entity = entityWithRole.entity;
     }
 }
 
